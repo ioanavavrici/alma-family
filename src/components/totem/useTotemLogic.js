@@ -110,10 +110,12 @@ export const useTotemLogic = () => {
     try {
       if (inputStream.current && inputStream.current.active) return;
 
+      // MODIFICARE: AM SCOS sampleRate: 16000 de aici!
+      // Lăsăm tableta să decidă (44100 sau 48000)
       const stream = await navigator.mediaDevices.getUserMedia({ 
           audio: { 
               channelCount: 1, 
-              sampleRate: 16000,
+              // sampleRate: 16000, <--- ȘTERS (Asta bloca tableta)
               echoCancellation: true, 
               noiseSuppression: true,
               autoGainControl: true
@@ -121,8 +123,18 @@ export const useTotemLogic = () => {
       });
       inputStream.current = stream;
       
-      if (!audioContext.current) audioContext.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-      if (audioContext.current.state === 'suspended') await audioContext.current.resume();
+      // AICI FORȚĂM CONVERSIA LA 16000 PENTRU SERVER
+      // Browserul va face automat downsampling de la 48k la 16k
+      if (!audioContext.current) {
+          audioContext.current = new (window.AudioContext || window.webkitAudioContext)({ 
+              sampleRate: 16000, // <--- Păstrăm aici pentru Backend
+              latencyHint: 'interactive'
+          });
+      }
+      
+      if (audioContext.current.state === 'suspended') {
+          await audioContext.current.resume();
+      }
 
       const source = audioContext.current.createMediaStreamSource(stream);
       processor.current = audioContext.current.createScriptProcessor(4096, 1, 1);
@@ -142,37 +154,26 @@ export const useTotemLogic = () => {
         const vol = Math.min(100, Math.round(average * 5000));
         setMicVolume(vol);
 
-        // --- DETECTARE VOCE ---
+        // Detectare Voce
         if (average > 0.005) { 
              setIsTalking(true);
-
-             // 1. Dacă e prima oară când detectăm voce în această sesiune de vorbire
              if (!speakingStartTimeRef.current) {
                  speakingStartTimeRef.current = Date.now();
-                 // Doar amânăm timerul momentan (poate e doar un "hmm")
                  delaySilenceTimer();
              } else {
-                 // 2. Calculăm cât timp a vorbit continuu
                  const duration = Date.now() - speakingStartTimeRef.current;
-                 
-                 // 3. Dacă a vorbit mai mult de 1.5 secunde continuu -> E UN RĂSPUNS
                  if (duration > 1500) {
-                     killSilenceTimer(); // Gata, nu mai intervenim cu ajutor
+                     killSilenceTimer(); 
                  } else {
-                     delaySilenceTimer(); // Încă nu suntem siguri, doar amânăm
+                     delaySilenceTimer();
                  }
              }
-             
-             // Resetăm flag-ul de "talking" vizual după scurt timp
              setTimeout(() => setIsTalking(false), 200);
-
         } else {
-            // Dacă se face liniște, resetăm contorul de "timp vorbit continuu"
-            // dar NU repornim timerul de ajutor dacă a fost deja ucis (killSilenceTimer)
             speakingStartTimeRef.current = null;
         }
 
-        // Trimitere la server
+        // Trimitere Server (Acum datele sunt sigur la 16000Hz datorită AudioContext)
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
             const buffer = new Int16Array(inputData.length);
             for (let i = 0; i < inputData.length; i++) {
@@ -191,6 +192,7 @@ export const useTotemLogic = () => {
 
     } catch (err) {
       console.error("❌ EROARE MICROFON:", err);
+      // alert("Eroare la pornirea microfonului: " + err.message);
     }
   };
 
