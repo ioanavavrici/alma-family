@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { User, Plus, Trash2, Upload, Camera, Activity, Pencil, Save, X, FileText } from 'lucide-react';
 import api from '../api';
 
-export default function Dashboard({ profile, memories, onAddMemory, onDeleteMemory, onUpdateProfile, onLogout }) {
+// ⚠️ NOTA: Am scos 'onAddMemory' și am pus 'onRefresh'
+export default function Dashboard({ profile, memories, onRefresh, onDeleteMemory, onUpdateProfile, onLogout }) {
   // State Upload
   const [title, setTitle] = useState('');
   const [desc, setDesc] = useState('');
@@ -15,11 +16,10 @@ export default function Dashboard({ profile, memories, onAddMemory, onDeleteMemo
   const [editName, setEditName] = useState('');
   const [editDetails, setEditDetails] = useState('');
 
-  // State Senzor (Simulat)
+  // State Senzor
   const [lastMovement, setLastMovement] = useState("Fără activitate recentă");
   const [isActive, setIsActive] = useState(false);
 
-  // --- INITIALIZARE EDITARE ---
   useEffect(() => {
     if (profile) {
       setEditName(profile.nume);
@@ -27,7 +27,6 @@ export default function Dashboard({ profile, memories, onAddMemory, onDeleteMemo
     }
   }, [profile, isEditingProfile]);
 
-  // --- HANDLERS ---
   const simulateMotion = () => {
     const time = new Date().toLocaleTimeString('ro-RO');
     setLastMovement(`Activitate detectată la ${time}`);
@@ -51,45 +50,35 @@ export default function Dashboard({ profile, memories, onAddMemory, onDeleteMemo
   const submitMemory = async (e) => {
     e.preventDefault();
     if (!title || !desc || !file) {
-        alert("Te rog completează titlul, descrierea și alege o poză.");
-        return;
-    }
-
-    if (!profile || !profile.id) {
-        alert("Eroare critică: Lipsă ID Pacient. Dă logout și login din nou.");
+        alert("Te rog completează toate câmpurile.");
         return;
     }
 
     setUploading(true);
     try {
       const formData = new FormData();
-      // Backend-ul așteaptă exact aceste chei:
       formData.append('pacient_id', profile.id); 
       formData.append('titlu', title);
       formData.append('descriere', desc);
       formData.append('file', file);
 
-      console.log("Se trimite upload pentru ID:", profile.id); // Debug
-
-      // --- FIX-UL ESTE AICI: NU mai punem headers manual ---
+      // 1. Upload
       await api.post('/familie/upload-amintire', formData);
+
+      // 2. REFRESH REAL DE LA SERVER
+      // Asta va cere lista actualizată din baza de date
+      await onRefresh(); 
       
-      // Actualizare UI
-      onAddMemory(title, desc, preview);
-      
-      // Reset
+      // 3. Reset UI
       setTitle('');
       setDesc('');
       setFile(null);
       setPreview(null);
-      alert("✅ Amintire salvată cu succes!");
+      alert("✅ Amintire salvată!");
       
     } catch (err) {
-      console.error("Eroare Upload:", err);
-      // Afișăm eroarea exactă de la server dacă există
-      const serverError = err.response?.data?.detail;
-      const displayError = typeof serverError === 'object' ? JSON.stringify(serverError) : serverError;
-      alert("❌ Eroare la upload: " + (displayError || err.message));
+      console.error(err);
+      alert("Eroare la upload: " + err.message);
     } finally {
       setUploading(false);
     }
@@ -214,7 +203,7 @@ export default function Dashboard({ profile, memories, onAddMemory, onDeleteMemo
              </div>
           ) : (
             <div className="grid grid-cols-1 gap-6">
-              {memories.map((mem) => (    
+              {memories.map((mem) => (
                 <div key={mem.id} className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 flex gap-4 items-start hover:shadow-md transition">
                   <div className="w-32 h-32 flex-shrink-0 overflow-hidden rounded-xl bg-gray-100">
                     <img src={mem.url} className="w-full h-full object-cover" />
@@ -222,6 +211,7 @@ export default function Dashboard({ profile, memories, onAddMemory, onDeleteMemo
                   <div className="flex-1">
                     <div className="flex justify-between items-start">
                       <h4 className="font-bold text-lg text-gray-800">{mem.titlu}</h4>
+                      {/* Buton stergere conectat la funcția din App.jsx */}
                       <button onClick={() => onDeleteMemory(mem.id)} className="text-gray-300 hover:text-red-500"><Trash2 className="w-4 h-4" /></button>
                     </div>
                     <p className="text-xs text-gray-400 mb-2">{mem.date}</p>
