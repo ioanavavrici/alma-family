@@ -27,58 +27,76 @@ export const useTotemLogic = () => {
   const isPlayingRef = useRef(false);
   const currentSourceNode = useRef(null);
   
-  // Timerul pentru tăcere
   const silenceTimer = useRef(null); 
-  // Ref pentru a măsura cât timp vorbește pacientul
   const speakingStartTimeRef = useRef(null);
+  const nextStartTimeRef = useRef(0);
+  const hasPatientSpokenRef = useRef(false);
 
   const pacientId = localStorage.getItem('totem_pacient_id');
   const pacientNume = localStorage.getItem('totem_pacient_nume');
 
   // ==========================================
-  // 3. LOGICA DE HELPER (TIMER)
+  // 3. RECUNOAȘTERE VOCALĂ
   // ==========================================
+  useEffect(() => {
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        speechRecognition.current = new SpeechRecognition();
+        speechRecognition.current.continuous = true; 
+        speechRecognition.current.interimResults = true; 
+        speechRecognition.current.lang = 'ro-RO';
+        speechRecognition.current.maxAlternatives = 1;
 
+        speechRecognition.current.onresult = (event) => {
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+                const transcript = event.results[i][0].transcript.toLowerCase().trim();
+                
+                if (!sessionActiveRef.current && transcript.includes('alma')) {
+                    try { speechRecognition.current.abort(); } catch(e){}
+                    toggleSession();
+                }
+                if (sessionActiveRef.current && ['stop', 'gata', 'oprește', 'termină'].some(w => transcript.includes(w))) {
+                    try { speechRecognition.current.abort(); } catch(e){}
+                    toggleSession();
+                }
+            }
+        };
+        speechRecognition.current.onend = () => { try { speechRecognition.current.start(); } catch(e) {} };
+        try { speechRecognition.current.start(); } catch(e) {}
+    }
+  }, []);
+
+  // ==========================================
+  // 4. TIMER ADAPTIV
+  // ==========================================
   const triggerSilenceIntervention = () => {
-      console.log("🚨 TĂCERE COMPLETĂ (5s) -> Cerem indiciu.");
+      const textMesaj = hasPatientSpokenRef.current 
+        ? "(Pacientul a vorbit și așteaptă. Răspunde-i sau confirmă.)"
+        : "(Pacientul tace de 15 secunde. Oferă un indiciu blând.)";
+
+      console.log(`🚨 TĂCERE -> ${textMesaj}`);
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          ws.current.send(JSON.stringify({ 
-              type: 'text', 
-              text: "(Pacientul nu a scos niciun sunet de 5 secunde. E posibil să fie blocat. Intervină cu un indiciu.)" 
-          }));
+          ws.current.send(JSON.stringify({ type: 'text', text: textMesaj }));
           setIsThinking(true);
       }
   };
 
-  const startSilenceTimer = () => {
-    // Curățăm orice timer vechi
+  const startSmartTimer = () => {
     if (silenceTimer.current) clearTimeout(silenceTimer.current);
-
-    if (isSessionActive) {
-        // console.log("⏳ Timer Help pornit (15s)");
-        silenceTimer.current = setTimeout(triggerSilenceIntervention, 5000); 
-    }
+    if (!isSessionActive) return;
+    const timeToWait = hasPatientSpokenRef.current ? 4000 : 15000;
+    silenceTimer.current = setTimeout(triggerSilenceIntervention, timeToWait);
   };
 
-  // Această funcție doar amână timerul (pentru sunete scurte)
-  const delaySilenceTimer = () => {
-    if (silenceTimer.current) {
-        clearTimeout(silenceTimer.current);
-        silenceTimer.current = setTimeout(triggerSilenceIntervention, 15000);
-    }
-  };
-
-  // Această funcție OMOARĂ timerul (când pacientul a vorbit destul)
   const killSilenceTimer = () => {
     if (silenceTimer.current) {
-        console.log("✅ Răspuns valid detectat -> Anulăm ajutorul AI.");
         clearTimeout(silenceTimer.current);
         silenceTimer.current = null;
     }
   };
 
   // ==========================================
-  // 4. HELPERE AUDIO
+  // 5. HELPERE AUDIO (DOWNSAMPLING)
   // ==========================================
   const stopRecording = () => {
     if (inputStream.current) {
@@ -91,18 +109,50 @@ export const useTotemLogic = () => {
     }
     setIsTalking(false);
     setMicVolume(0);
-    speakingStartTimeRef.current = null;
   };
 
-  const startCommandListener = () => {
-    try { if (speechRecognition.current) speechRecognition.current.start(); } catch (e) {}
+  const stopAiSpeaking = () => {
+    if (currentSourceNode.current) {
+        try { currentSourceNode.current.stop(); } catch(e){}
+    }
+    nextStartTimeRef.current = 0;
+    isPlayingRef.current = false;
+    setAiSpeaking(false);
+    setIsThinking(false);
+    
+    if (sessionActiveRef.current) {
+        hasPatientSpokenRef.current = false;
+        startRawRecording();
+        startSmartTimer();
+    }
   };
-  const stopCommandListener = () => {
-    try { if (speechRecognition.current) speechRecognition.current.stop(); } catch (e) {}
+
+  // --- FUNCȚIE MATEMATICĂ PENTRU A CONVERTI 48k -> 16k ---
+  const downsampleBuffer = (buffer, inputSampleRate, outputSampleRate) => {
+    if (outputSampleRate === inputSampleRate) {
+        return buffer;
+    }
+    var sampleRateRatio = inputSampleRate / outputSampleRate;
+    var newLength = Math.round(buffer.length / sampleRateRatio);
+    var result = new Float32Array(newLength);
+    var offsetResult = 0;
+    var offsetBuffer = 0;
+    while (offsetResult < result.length) {
+        var nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        var accum = 0, count = 0;
+        for (var i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+            accum += buffer[i];
+            count++;
+        }
+        result[offsetResult] = accum / count;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
   };
 
   // ==========================================
-  // 5. MICROFON (CU LOGICA NOUTĂ DE VALIDARE)
+  // 6. MICROFON (CU CONVERSIE SIGURĂ LA 16000Hz)
   // ==========================================
   const startRawRecording = async () => {
     if (!sessionActiveRef.current) return;
@@ -110,12 +160,9 @@ export const useTotemLogic = () => {
     try {
       if (inputStream.current && inputStream.current.active) return;
 
-      // MODIFICARE: AM SCOS sampleRate: 16000 de aici!
-      // Lăsăm tableta să decidă (44100 sau 48000)
       const stream = await navigator.mediaDevices.getUserMedia({ 
           audio: { 
               channelCount: 1, 
-              // sampleRate: 16000, <--- ȘTERS (Asta bloca tableta)
               echoCancellation: true, 
               noiseSuppression: true,
               autoGainControl: true
@@ -123,20 +170,20 @@ export const useTotemLogic = () => {
       });
       inputStream.current = stream;
       
-      // AICI FORȚĂM CONVERSIA LA 16000 PENTRU SERVER
-      // Browserul va face automat downsampling de la 48k la 16k
+      // Lăsăm AudioContext-ul să folosească rata NATIVĂ a tabletei (ex: 48000)
       if (!audioContext.current) {
-          audioContext.current = new (window.AudioContext || window.webkitAudioContext)({ 
-              sampleRate: 16000, // <--- Păstrăm aici pentru Backend
-              latencyHint: 'interactive'
-          });
+          audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
       }
-      
       if (audioContext.current.state === 'suspended') {
           await audioContext.current.resume();
       }
 
+      // Aflăm rata reală a tabletei
+      const inputSampleRate = audioContext.current.sampleRate;
+      const targetSampleRate = 16000; // Ce vrea AI-ul
+
       const source = audioContext.current.createMediaStreamSource(stream);
+      // Buffer mare (4096) pentru eficiență
       processor.current = audioContext.current.createScriptProcessor(4096, 1, 1);
 
       processor.current.onaudioprocess = (e) => {
@@ -145,44 +192,39 @@ export const useTotemLogic = () => {
             return;
         }
 
-        const inputData = e.inputBuffer.getChannelData(0);
+        let inputData = e.inputBuffer.getChannelData(0);
         
-        // Calcul Volum
+        // --- 1. DETECTARE VOLUM (pe sunetul original) ---
         let sum = 0;
         for(let i=0; i<inputData.length; i++) sum += Math.abs(inputData[i]);
         const average = sum / inputData.length;
-        const vol = Math.min(100, Math.round(average * 5000));
-        setMicVolume(vol);
+        setMicVolume(Math.min(100, Math.round(average * 5000)));
 
-        // Detectare Voce
         if (average > 0.005) { 
              setIsTalking(true);
-             if (!speakingStartTimeRef.current) {
-                 speakingStartTimeRef.current = Date.now();
-                 delaySilenceTimer();
-             } else {
-                 const duration = Date.now() - speakingStartTimeRef.current;
-                 if (duration > 1500) {
-                     killSilenceTimer(); 
-                 } else {
-                     delaySilenceTimer();
-                 }
-             }
+             if (!hasPatientSpokenRef.current) hasPatientSpokenRef.current = true;
+             startSmartTimer();
              setTimeout(() => setIsTalking(false), 200);
-        } else {
-            speakingStartTimeRef.current = null;
         }
 
-        // Trimitere Server (Acum datele sunt sigur la 16000Hz datorită AudioContext)
+        // --- 2. DOWNSAMPLING (CONVERSIE 48k -> 16k) ---
+        // Asta e cheia! Transformăm sunetul în formatul corect înainte de trimitere
+        const downsampledData = downsampleBuffer(inputData, inputSampleRate, targetSampleRate);
+
+        // --- 3. CONVERSIE ÎN INT16 PENTRU SERVER ---
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-            const buffer = new Int16Array(inputData.length);
-            for (let i = 0; i < inputData.length; i++) {
-                let s = Math.max(-1, Math.min(1, inputData[i]));
+            const buffer = new Int16Array(downsampledData.length);
+            for (let i = 0; i < downsampledData.length; i++) {
+                let s = Math.max(-1, Math.min(1, downsampledData[i]));
                 buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
+            
+            // Convertim la binary string -> base64
             let binary = '';
             const bytes = new Uint8Array(buffer.buffer);
+            // Optimizare mică: loop mai eficient ar fi ideal, dar acesta e safe
             for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            
             ws.current.send(JSON.stringify({ type: 'audio', data: window.btoa(binary) }));
         }
       };
@@ -192,64 +234,71 @@ export const useTotemLogic = () => {
 
     } catch (err) {
       console.error("❌ EROARE MICROFON:", err);
-      // alert("Eroare la pornirea microfonului: " + err.message);
     }
   };
 
   // ==========================================
-  // 6. AUDIO PLAYBACK
+  // 7. AUDIO PLAYBACK (SEAMLESS)
   // ==========================================
-  const playAudioChunk = (base64String) => {
-    return new Promise((resolve) => {
+  const playAudioChunk = async (base64String) => {
       try {
-        if (!audioContext.current) audioContext.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        if (!audioContext.current) {
+            audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.current.state === 'suspended') {
+            await audioContext.current.resume();
+        }
+
         const binaryString = window.atob(base64String);
         const len = binaryString.length;
         const bytes = new Uint8Array(len);
         for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+        
         const float32Array = new Float32Array(bytes.length / 2);
         const dataView = new DataView(bytes.buffer);
-        for (let i = 0; i < bytes.length / 2; i++) float32Array[i] = dataView.getInt16(i * 2, true) / 32768.0;
-        
-        const audioBuffer = audioContext.current.createBuffer(1, float32Array.length, 24000);
+        for (let i = 0; i < bytes.length / 2; i++) {
+            float32Array[i] = dataView.getInt16(i * 2, true) / 32768.0;
+        }
+
+        const serverSampleRate = 24000; 
+        const audioBuffer = audioContext.current.createBuffer(1, float32Array.length, serverSampleRate);
         audioBuffer.getChannelData(0).set(float32Array);
+
         const source = audioContext.current.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioContext.current.destination);
+
+        const currentTime = audioContext.current.currentTime;
+        if (nextStartTimeRef.current < currentTime) {
+            nextStartTimeRef.current = currentTime + 0.1;
+        }
+
+        source.start(nextStartTimeRef.current);
+        nextStartTimeRef.current += audioBuffer.duration;
         currentSourceNode.current = source;
-        source.onended = () => { resolve(); };
-        source.start();
-      } catch (e) { resolve(); }
-    });
+
+      } catch (e) {
+        console.error("Playback error:", e);
+      }
   };
 
   const processQueue = async () => {
-    if (audioQueue.current.length === 0) {
-      stopAiSpeaking();
-      return;
+    while (audioQueue.current.length > 0 && isPlayingRef.current && sessionActiveRef.current) {
+        const nextChunk = audioQueue.current.shift();
+        await playAudioChunk(nextChunk); 
     }
-    if (!isPlayingRef.current || !sessionActiveRef.current) return;
-    
-    const nextChunk = audioQueue.current.shift();
-    await playAudioChunk(nextChunk);
-    processQueue();
-  };
-
-  const stopAiSpeaking = () => {
-    if (currentSourceNode.current) try { currentSourceNode.current.stop(); } catch(e){}
-    
-    isPlayingRef.current = false;
-    setAiSpeaking(false);
-    setIsThinking(false);
-    
-    if (sessionActiveRef.current) {
-        startRawRecording();
-        startSilenceTimer(); // Resetăm timerul la începutul turei pacientului
+    if (isPlayingRef.current && sessionActiveRef.current) {
+        const currentTime = audioContext.current?.currentTime || 0;
+        if (audioQueue.current.length === 0 && currentTime > nextStartTimeRef.current + 0.2) {
+            stopAiSpeaking(); 
+        } else {
+            setTimeout(processQueue, 100);
+        }
     }
   };
 
   // ==========================================
-  // 7. WEBSOCKET
+  // 8. WEBSOCKET & SESIUNE
   // ==========================================
   const connectWebSocket = () => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -259,17 +308,14 @@ export const useTotemLogic = () => {
     ws.current = new WebSocket(`${protocol}//${host}/totem/ws/${pacientId}`);
 
     ws.current.onopen = () => {
-      console.log("✅ WebSocket Conectat");
       setStatus("Activ");
-      startSilenceTimer();
+      hasPatientSpokenRef.current = false;
+      startSmartTimer(); 
     };
 
     ws.current.onmessage = (event) => {
       if (!sessionActiveRef.current) return;
-      
-      // Orice răspuns de la AI anulează imediat timerul
       killSilenceTimer();
-
       const msg = JSON.parse(event.data);
 
       if (msg.type === 'audio_response') {
@@ -278,7 +324,6 @@ export const useTotemLogic = () => {
           isPlayingRef.current = true;
           setIsThinking(true);
           stopRecording(); 
-          
           setTimeout(() => {
             if (isPlayingRef.current) {
                 setIsThinking(false);
@@ -294,89 +339,42 @@ export const useTotemLogic = () => {
       }
     };
 
-    ws.current.onclose = () => {
-        if (sessionActiveRef.current) setStatus("Deconectat (Reîncerc...)");
-    };
+    ws.current.onclose = () => { if (sessionActiveRef.current) setStatus("Deconectat"); };
   };
 
-  // ==========================================
-  // 8. CONTROL SESIUNE
-  // ==========================================
   const toggleSession = async () => {
     if (sessionActiveRef.current) {
-        // STOP
         sessionActiveRef.current = false;
         setIsSessionActive(false);
         setStatus("Standby");
-        
         stopAiSpeaking(); 
         stopRecording();
-        if (silenceTimer.current) clearTimeout(silenceTimer.current);
+        killSilenceTimer();
         if (ws.current) ws.current.close();
-
     } else {
-        // START
         sessionActiveRef.current = true;
         setIsSessionActive(true);
         setStatus("Se conectează...");
-
         try {
-            if (!audioContext.current) {
-                audioContext.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            }
-            if (audioContext.current.state === 'suspended') {
-                await audioContext.current.resume();
-            }
-        } catch (e) {
-            console.error("AudioContext Resume Error:", e);
-        }
-
+            if (!audioContext.current) audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioContext.current.state === 'suspended') await audioContext.current.resume();
+        } catch (e) {}
         connectWebSocket();
         startRawRecording();
     }
   };
 
-  // ==========================================
-  // 9. INITIALIZARE
-  // ==========================================
   useEffect(() => {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        speechRecognition.current = new SpeechRecognition();
-        speechRecognition.current.continuous = true;
-        speechRecognition.current.interimResults = true;
-        speechRecognition.current.lang = 'ro-RO';
-        speechRecognition.current.onresult = (event) => {
-          const transcript = Array.from(event.results).map(r => r[0].transcript).join('').toLowerCase();
-          
-          // Dacă recunoașterea vocală aude ceva, anulăm timerul
-          if (transcript.length > 0) killSilenceTimer();
-
-          if (['stop', 'gata', 'oprește', 'termină'].some(w => transcript.includes(w))) {
-             stopAiSpeaking(); 
-          }
-        };
-    }
-
     return () => {
       sessionActiveRef.current = false;
       stopRecording();
-      if (silenceTimer.current) clearTimeout(silenceTimer.current);
+      killSilenceTimer();
       if (ws.current) ws.current.close();
     };
   }, []);
 
   return {
-    status,
-    isSessionActive,
-    toggleSession,
-    currentImage,
-    imageTitle,
-    isTalking,
-    micVolume,
-    aiSpeaking,
-    isThinking,
-    pacientNume,
+    status, isSessionActive, toggleSession, currentImage, imageTitle, isTalking, micVolume, aiSpeaking, isThinking, pacientNume,
     clearImage: () => setCurrentImage(null)
   };
 };
